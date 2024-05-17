@@ -3,26 +3,16 @@ package main
 import (
 	"bufio"
 	"flag"
-	"fmt"
 	"io"
 	"log"
 	"os"
 	"runtime"
 	"runtime/pprof"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
-
-type Aggregate struct {
-	min   float64
-	max   float64
-	sum   float64
-	count float64
-	mean  float64
-}
 
 func timer(name string) func() {
 	start := time.Now()
@@ -32,16 +22,16 @@ func timer(name string) func() {
 }
 
 func main() {
-	var lenghtQueueBuffer = flag.Int("buffersize", 1000, "length of message buffer")
-	var cpuProfile = flag.Bool("cpuprofile", false, "switch on cpu profile")
-	var blockProfile = flag.Bool("blockprofile", false, "switch on block profile")
-	var fileName = flag.String("filename", "measurements.txt", "name of the file")
-	var chunkSize = flag.Int("chunksize", 10, "chunks")
+	lenghtQueueBuffer := flag.Int("buffersize", 1000, "length of message buffer")
+	cpuProfile := flag.Bool("cpuprofile", false, "switch on cpu profile")
+	blockProfile := flag.Bool("blockprofile", false, "switch on block profile")
+	fileName := flag.String("filename", "measurements.txt", "name of the file")
+	chunkSize := flag.Int("chunksize", 10, "chunks")
 
 	flag.Parse()
 
 	if *cpuProfile {
-		f, err := os.Create("cpu_profile_first_attempt_" + fmt.Sprint(*lenghtQueueBuffer) + ".prof")
+		f, err := os.Create("cpu_profile.prof")
 		if err != nil {
 			log.Fatalln("failed to create profile file, err=%w", err)
 		}
@@ -54,7 +44,7 @@ func main() {
 	}
 
 	if *blockProfile {
-		f, err := os.Create("block_profile_first_attempt_" + fmt.Sprint(*lenghtQueueBuffer) + ".prof")
+		f, err := os.Create("block_profile.prof")
 		if err != nil {
 			log.Fatalln("failed to create block profile file, err=%w", err)
 		}
@@ -64,24 +54,29 @@ func main() {
 	}
 
 	defer timer("main")()
-	station_names, aggregates := calculateAggregates(*lenghtQueueBuffer, *chunkSize, *fileName)
-	presentResults(station_names, aggregates)
+	aggregates := calculateAggregates(*lenghtQueueBuffer, *chunkSize, *fileName)
+	aggregates.presentResults()
 }
 
-func calculateAggregates(lengthQueueBuffer int, chunkSize int, fileName string) (map[string]bool, map[string]Aggregate) {
+func calculateAggregates(lengthQueueBuffer int, chunkSize int, fileName string) *Aggregates {
 	log.Printf("Calculating aggregates with buffer size %v and chunk size %v", lengthQueueBuffer, chunkSize)
-	stations := make(map[string]bool)
-	aggregates := make(map[string]Aggregate)
+	messages := make(chan []string, lengthQueueBuffer)
+	allAggregates := make([]*Aggregates, 0, runtime.NumCPU())
+	resultsQueue := make(chan *Aggregates, runtime.NumCPU())
 
 	var wg sync.WaitGroup
-	wg.Add(2)
-	messages := make(chan []string, lengthQueueBuffer)
-
+	wg.Add(3)
 	go readThroughFile(&wg, messages, chunkSize)
-	go processLineChunksFromFile(&wg, messages, stations, aggregates)
+	go processLineChunksFromFile(&wg, messages, resultsQueue)
+	go accumalateResults(&wg, resultsQueue, &allAggregates)
 	wg.Wait()
 
-	return stations, aggregates
+	mergedAggregates := NewAggregates()
+	for _, aggregates := range allAggregates {
+		mergedAggregates.Update(aggregates)
+	}
+
+	return mergedAggregates
 }
 
 func readThroughFile(wg *sync.WaitGroup, messages chan<- []string, chunkSize int) {
@@ -101,7 +96,7 @@ func readThroughFile(wg *sync.WaitGroup, messages chan<- []string, chunkSize int
 
 	lines := make([]string, 0, chunkSize)
 	j := 0
-	for i := 0; i < 100_000_000; i++ {
+	for {
 		rawLine, _, err := r.ReadLine()
 		if err == io.EOF {
 			break
@@ -123,14 +118,34 @@ func readThroughFile(wg *sync.WaitGroup, messages chan<- []string, chunkSize int
 	}
 }
 
-func processLineChunksFromFile(wg *sync.WaitGroup, messages <-chan []string, stations map[string]bool, aggregates map[string]Aggregate) {
+func processLineChunksFromFile(wgTop *sync.WaitGroup, messages <-chan []string, resultsQueue chan<- *Aggregates) {
+	defer wgTop.Done()
+
+	var wg sync.WaitGroup
+	for i := 1; i < runtime.NumCPU(); i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			partialAggregates := NewAggregates()
+			for chunk := range messages {
+				processLineFromChunk(chunk, partialAggregates)
+			}
+			resultsQueue <- partialAggregates
+		}()
+	}
+
+	wg.Wait()
+	close(resultsQueue)
+}
+
+func accumalateResults(wg *sync.WaitGroup, resultsQueue <-chan *Aggregates, allAggregates *[]*Aggregates) {
 	defer wg.Done()
-	for chunk := range messages {
-		processLineFromChunk(chunk, stations, aggregates)
+	for result := range resultsQueue {
+		*allAggregates = append(*allAggregates, result)
 	}
 }
 
-func processLineFromChunk(chunks []string, stations map[string]bool, aggregates map[string]Aggregate) {
+func processLineFromChunk(chunks []string, aggregates *Aggregates) {
 	for _, message := range chunks {
 		if strings.HasPrefix(message, "#") {
 			continue
@@ -147,44 +162,6 @@ func processLineFromChunk(chunks []string, stations map[string]bool, aggregates 
 			log.Fatalf("Failed to parse string to float for %s, err = %s", measurements[1], err)
 		}
 
-		stations[name] = true
-		agg, found := aggregates[name]
-		if found {
-			agg.count += 1
-			agg.sum += temperature
-			agg.mean = agg.sum / agg.count
-
-			if temperature > agg.max {
-				agg.max = temperature
-			}
-
-			if temperature < agg.min {
-				agg.min = temperature
-			}
-			aggregates[name] = agg
-		}
-		if !found {
-			aggregates[name] = Aggregate{min: temperature, max: temperature, sum: temperature, count: 1, mean: temperature}
-		}
+		aggregates.Upsert(name, temperature)
 	}
-}
-
-func presentResults(stations map[string]bool, aggregates map[string]Aggregate) {
-	n_stations := len(stations)
-
-	ordered_stations := make([]string, 0, n_stations)
-	for k := range stations {
-		ordered_stations = append(ordered_stations, k)
-	}
-	slices.Sort(ordered_stations)
-	log.Printf("Total number of stations: %v", n_stations)
-	result := make([]string, 0, n_stations)
-	for _, station := range ordered_stations {
-		agg := aggregates[station]
-		station_result := fmt.Sprintf("%s=%.1f/%.1f/%.1f", station, agg.min, agg.mean, agg.max)
-		result = append(result, station_result)
-	}
-
-	full_result := strings.Join(result[:10], ", ")
-	log.Printf("{%s}", full_result)
 }
